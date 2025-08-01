@@ -1,0 +1,16 @@
+torch
+transformers
+accelerate
+gradio
+numpy
+pygame
+scipy
+sentence-transformers
+faiss-cpu
+Pillow
+pydub
+pyvirtualdisplay
+diffusers
+xformers
+invisible-watermark
+psutil
