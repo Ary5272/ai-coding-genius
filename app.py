@@ -1,31 +1,66 @@
 # app.py
-# 🤖 AI Coding Genius - Friendly, powerful, and ready to deploy
+# 🤖 AI Coding Genius: Omega Core
+# "The most advanced AI coder deployable on Hugging Face"
 import os
 import torch
-import subprocess
 import gradio as gr
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import numpy as np
 from scipy.io import wavfile
-from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech
-from datasets import load_dataset
+from sentence_transformers import SentenceTransformer
+import faiss
+import zipfile
+import io
+from PIL import Image
 
-# --- Load Code Model ---
-model_name = "deepseek-ai/deepseek-coder-6.7b-instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16,
-    device_map="auto",
-    low_cpu_mem_usage=True
-)
+# ─────────────────────────────────────────────────────────────
+# 🔌 Import Local Modules
+# ─────────────────────────────────────────────────────────────
+try:
+    from agents.coder import CoderAgent
+    from agents.reviewer import ReviewerAgent
+    from utils.tts import TextToSpeech
+    from utils.stt import SpeechToText
+    from utils.preview import render_pygame_preview
+    from utils.export import create_project_zip
+    from utils.gist import create_gist
+except Exception as e:
+    gr.Error(f"Missing module: {e}")
 
-# --- Load TTS Model ---
-tts_processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
-tts_model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts")
-embeds = load_dataset("Matthijs/cmu-arctic-xvectors", name="cmu_us_awb", split="validation")
-speaker_embeddings = torch.tensor(embeds[7306]["xvector"]).unsqueeze(0)
+# ─────────────────────────────────────────────────────────────
+# 🧠 Initialize Systems
+# ─────────────────────────────────────────────────────────────
+# Coder
+coder = CoderAgent()
 
-# --- Safe Code Execution ---
+# Reviewer
+reviewer = ReviewerAgent()
+
+# TTS
+tts = TextToSpeech()
+
+# STT
+stt = SpeechToText()
+
+# Memory (FAISS)
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+dimension = 384
+index = faiss.IndexFlatL2(dimension)
+memory_store = []  # Stores {"prompt": str, "code": str}
+
+# Stable Diffusion (Texture Gen)
+try:
+    from diffusers import StableDiffusionPipeline
+    sd_pipe = StableDiffusionPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        torch_dtype=torch.float16
+    ).to("cuda")
+    sd_ready = True
+except:
+    sd_ready = False
+
+# ─────────────────────────────────────────────────────────────
+# 🛠️ Helper: Run Code Safely
+# ─────────────────────────────────────────────────────────────
 def run_code_safely(code, timeout=10):
     os.makedirs("sandbox", exist_ok=True)
     path = "sandbox/temp_code.py"
@@ -40,61 +75,150 @@ def run_code_safely(code, timeout=10):
         )
         return result.stdout, result.stderr
     except subprocess.TimeoutExpired:
-        return "", "❌ Execution timed out (infinite loop?)."
+        return "", "Timeout: Code took too long."
     except Exception as e:
-        return "", f"💥 Error: {e}"
+        return "", f"Error: {e}"
 
-# --- Generate Code ---
-def generate_code(prompt):
+# ─────────────────────────────────────────────────────────────
+# 💬 Main Coding Pipeline
+# ─────────────────────────────────────────────────────────────
+def full_pipeline(prompt):
     if not prompt.strip():
-        return "Hey! 😊 Please tell me what to code.", "Try something like 'bouncing ball'", None
+        return "Say something!", None, None, None
 
-    full_prompt = f"""
-You're a friendly AI coder. Write clean, commented Python code.
-Explain what you're doing.
-
-Task: {prompt}
-""".strip()
-
-    inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=3072).to("cuda")
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=1024, temperature=0.4)
-    
-    generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    code = generated[len(full_prompt):].strip()
-
-    # Extract if in ```python
-    if "```python" in code:
+    # 1. Generate code
+    raw_code = coder.generate(prompt)
+    final_code = raw_code
+    if "```python" in raw_code:
         try:
-            code = code.split("```python")[1].split("```")[0].strip()
+            final_code = raw_code.split("```python")[1].split("```")[0].strip()
         except:
             pass
 
-    # Run code
-    stdout, stderr = run_code_safely(code)
+    # 2. Review code
+    review = reviewer.review(final_code)
+
+    # 3. Run code
+    stdout, stderr = run_code_safely(final_code)
     output = f".Stdout:\n{stdout}\n.Stderr:\n{stderr}"
 
-    # Generate voice
-    voice_text = f"Here's your code for: {prompt[:60]}..."
-    inputs_tts = tts_processor(text=voice_text, return_tensors="pt")
-    speech = tts_model.generate_speech(inputs_tts["input_ids"], speaker_embeddings)
-    wavfile.write("response.wav", 16000, speech.cpu().numpy())
-    
-    return code, output, "response.wav"
+    # 4. Save to memory
+    embedding = embedder.encode(prompt)
+    index.add(np.array([embedding]))
+    memory_store.append({"prompt": prompt, "code": final_code})
 
-# --- Gradio UI ---
-with gr.Blocks(title="AI Coding Genius") as demo:
-    gr.Markdown("# 🤖 AI Coding Genius")
-    gr.Markdown("I write and run Python code — from Pygame games to math art. Ask me anything!")
+    # 5. Voice explanation
+    voice_msg = f"Here's your code for {prompt[:60]}..."
+    audio_path = tts.speak(voice_msg, "assets/response.wav")
 
-    with gr.Row():
-        inp = gr.Textbox(label="💬 What should I code?", placeholder="e.g., A spinning 3D cube")
-        btn = gr.Button("🚀 Generate & Run", variant="primary")
+    # 6. Try preview (if Pygame)
+    preview_img = None
+    if "pygame" in final_code.lower():
+        buf = render_pygame_preview(final_code)
+        if buf:
+            preview_img = Image.open(buf)
 
-    code_out = gr.Code(label="💻 Generated Code")
-    exec_out = gr.Textbox(label="📦 Execution Output")
-    audio_out = gr.Audio(label="🎙️ Listen to Explanation")
+    return final_code, output, audio_path, review, preview_img
 
-    btn.click(generate_code, inp, [code_out, exec_out, audio_out])
+# ─────────────────────────────────────────────────────────────
+# 🎨 Generate Texture with SD
+# ─────────────────────────────────────────────────────────────
+def generate_texture(prompt):
+    if not sd_ready:
+        return None
+    try:
+        image = sd_pipe(prompt, num_inference_steps=30).images[0]
+        return image
+    except:
+        return None
 
-demo.launch()
+# ─────────────────────────────────────────────────────────────
+# 📦 Export Project
+# ─────────────────────────────────────────────────────────────
+def export_project(code, include_texture=None):
+    assets = {}
+    if include_texture:
+        assets["texture.png"] = b"dummy"  # In real, save image
+    zip_buffer = create_project_zip(code, assets)
+    return zip_buffer
+
+# ─────────────────────────────────────────────────────────────
+# 🎙️ Voice to Code
+# ─────────────────────────────────────────────────────────────
+def voice_to_code(audio):
+    text = stt.transcribe(audio)
+    return text  # Feed into main pipeline
+
+# ─────────────────────────────────────────────────────────────
+# 🧠 Show Memory
+# ─────────────────────────────────────────────────────────────
+def show_memory():
+    if not memory_store:
+        return "No past projects."
+    return "\n\n".join([
+        f"🔹 {m['prompt'][:50]}..." for m in memory_store[-5:]
+    ])
+
+# ─────────────────────────────────────────────────────────────
+# 🚀 Gradio UI
+# ─────────────────────────────────────────────────────────────
+with gr.Blocks(title="AI Coding Genius: Omega") as demo:
+    gr.Markdown("# 🤯 AI Coding Genius: Omega Edition")
+    gr.Markdown("The most advanced AI coder on Hugging Face. It **talks**, **codes**, **reviews**, **remembers**, and **creates**.")
+
+    with gr.Tabs():
+        # ─────────────────────────────────────────────────────
+        with gr.Tab("💻 Code & Run"):
+            inp = gr.Textbox(label="💬 What should I code?", placeholder="e.g., A rotating 3D cube")
+            btn = gr.Button("🚀 Generate & Run", variant="primary")
+
+            code_out = gr.Code(label="Generated Code")
+            output_out = gr.Textbox(label="Output")
+            audio_out = gr.Audio(label="🎙️ AI Voice")
+            review_out = gr.Textbox(label="🔍 AI Review")
+            preview_out = gr.Image(label="🎮 Preview (if Pygame)")
+
+            btn.click(
+                full_pipeline,
+                inp,
+                [code_out, output_out, audio_out, review_out, preview_out]
+            )
+
+        # ─────────────────────────────────────────────────────
+        with gr.Tab("🎙️ Voice Input"):
+            mic = gr.Audio(source="microphone", type="filepath", label="Speak your coding task")
+            mic_btn = gr.Button("🎤 Transcribe & Code")
+            mic_out = gr.Textbox(label="Transcribed Prompt")
+
+            mic_btn.click(voice_to_code, mic, mic_out)
+
+        # ─────────────────────────────────────────────────────
+        with gr.Tab("🎨 Generate Texture"):
+            tex_prompt = gr.Textbox(label="Describe texture", placeholder="e.g., cyberpunk city wall")
+            tex_btn = gr.Button("Generate")
+            tex_out = gr.Image(label="Generated Texture")
+
+            tex_btn.click(generate_texture, tex_prompt, tex_out)
+
+        # ─────────────────────────────────────────────────────
+        with gr.Tab("📦 Export Project"):
+            exp_btn = gr.Button("Download ZIP")
+            exp_out = gr.File(label="Project ZIP")
+
+            exp_btn.click(
+                lambda code: gr.File(value=export_project(code), visible=True),
+                inputs=code_out,
+                outputs=exp_out
+            )
+
+        # ─────────────────────────────────────────────────────
+        with gr.Tab("🧠 Memory"):
+            mem_btn = gr.Button("Show Recent Projects")
+            mem_out = gr.Textbox(label="Your AI's Memory")
+            mem_btn.click(show_memory, None, mem_out)
+
+# ─────────────────────────────────────────────────────────────
+# Launch
+# ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    demo.launch()
